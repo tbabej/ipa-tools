@@ -67,7 +67,8 @@ SubprocessResult = collections.namedtuple(
     'SubprocessResult', 'stdout stderr returncode')
 TracTicketData = collections.namedtuple(
     'TracTicketData', 'id time_created time_changed attributes')
-
+OidEntry = collections.namedtuple(
+    'OidEntry', 'oid name')
 
 def cleanpath(path):
     """Return absolute path with leading ~ expanded"""
@@ -154,6 +155,14 @@ class Patch(object):
         if not re.match('^[-_a-zA-Z0-9]+: .*$', self.head_lines[-1]):
             self.head_lines.append('\n')
         self.head_lines.append('Reviewed-By: %s\n' % reviewer)
+
+    @property
+    def modified_oids(self):
+        oid_regex = ("^\+(attributeTypes|objectClasses): "
+                     "\((?P<oid>[\d.]+) NAME '(?P<name>\w+)")
+        data = ''.join(self.patch_lines)
+        for match in re.finditer(oid_regex, data, re.MULTILINE):
+            yield OidEntry(match.group('oid'), match.group('name'))
 
     @property
     def lines(self):
@@ -277,12 +286,17 @@ class Pusher(object):
                 self.die('Git command failed')
         return SubprocessResult(stdout, stderr, returncode)
 
-    def ensure_clean_repo(self):
+    def ensure_clean_repo(self, git_dir=None, work_tree=None):
         """Make sure the working tree matches the git index"""
-        self.git('status', '--porcelain',
+        args = ['--git-dir', git_dir] if git_dir else []
+        args += ['--work-tree', work_tree] if work_tree else []
+        args += ['status', '--porcelain']
+
+        self.git(*args,
                  check_stdout='',
                  check_stderr='',
-                 fail_message='Repository %s not clean' % os.getcwd())
+                 fail_message='Repository %s not clean'
+                              % git_dir or os.getcwd())
 
     def get_rewiewers(self, tickets):
         """Get reviewer name & address, or None for --no-reviewer
@@ -345,6 +359,30 @@ class Pusher(object):
         if self.verbosity:
             print('Resulting hash: %s' % sha1)
         return sha1
+
+    def is_oid_registered(self, oid_entry):
+        oid_git = cleanpath(self.config.get('oid-git'))
+        oid = oid_entry.oid
+        name = oid_entry.name
+
+        if oid_git:
+            oid_git_path = os.path.join(oid_git, '.git/')
+            self.ensure_clean_repo(git_dir=oid_git_path, work_tree=oid_git)
+
+            result = self.git('--git-dir', oid_git_path,
+                              '--work-tree', oid_git,
+                              'grep', oid,
+                              check_returncode=None)
+            if result.returncode != 0:
+                print("OID %s (%s) is not registered" % (oid, name))
+                return False
+            elif name not in result.stdout:
+                print("OID %s (%s) clashes with:" % (oid, name))
+                print(result.stdout)
+                return False
+            else:
+                print("OID %s (%s) correctly registered" % (oid, name))
+                return True
 
     def print_push_info(self, patches, sha1s, ticket_numbers, tickets):
         """Print lots of info about the to-be-pushed commits"""
@@ -440,6 +478,17 @@ class Pusher(object):
                     patch.add_reviewer(reviewer)
         else:
             print('Reviewer: None')
+
+        # Check the OIDs
+        if not self.options.get('--no-oid-check', False):
+            if self.config.get('oid-git'):
+                missing_oids = [oid_entry for p in patches
+                                for oid_entry in p.modified_oids
+                                if not self.is_oid_registered(oid_entry)]
+                if missing_oids:
+                    self.die('OIDs in the patcheset are not registered')
+            else:
+                print('The oid-git option not found, skipping the OID check.')
 
         branches = self.options['--branch']
         if not branches:
